@@ -1,103 +1,152 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.applications import MobileNetV2
+from skimage import io, color, transform
+from skimage.feature import local_binary_pattern, hog, graycomatrix, graycoprops
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+import warnings
 
-# ==========================================================
-# 1. SIMULASI GENERATE DATASET KUSTOM (5 KELAS @100 GAMBAR)
-# ==========================================================
-print("=== 1. Membuat Dataset Simulasi Kustom (5 Kelas) ===")
-np.random.seed(42)
+# Mengabaikan warning kecil agar output terminal bersih dan rapi
+warnings.filterwarnings('ignore')
 
-# Mengikuti standar input MobileNetV2: 224x224 piksel dengan 3 channel (RGB)
-X_dummy = np.random.rand(500, 224, 224, 3).astype(np.float32)
-# Membuat label acak untuk 5 kelas (0, 1, 2, 3, 4)
-y_dummy = np.random.randint(0, 5, 500)
+# ==========================================
+# 1. KONFIGURASI DATASET
+# ==========================================
+DATASET_PATH = r"C:\mydocument\praktik_p_citra"
+IMG_SIZE = (128, 128)
+# 5 kelas tekstur sesuai yang ada di folder kamu
+class_folders = ['banded', 'blotchy', 'braided', 'bubbly', 'bumpy']
 
-# Membagi data menjadi 80% Latih (400 gambar) dan 20% Uji (100 gambar)
-X_train, X_test = X_dummy[:400], X_dummy[400:]
-y_train, y_test = y_dummy[:400], y_dummy[400:]
+# ==========================================
+# 2. FUNGSI EKSTRAKSI FITUR (LBP, HOG, GLCM)
+# ==========================================
+def extract_lbp(gray_img):
+    radius = 1
+    n_points = 8 * radius
+    lbp = local_binary_pattern(gray_img, n_points, radius, method='uniform')
+    
+    # PERBAIKAN DI BARIS INI:
+    # Ubah n_bins = int(lbp.max() + 1) menjadi:
+    n_bins = n_points + 2
+    
+    hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins), density=True)
+    return hist
 
-# ==========================================================
-# 2. MEMBANGUN MODEL CNN DARI NOL (SCRATCH)
-# ==========================================================
-print("\n=== 2. Membangun Model CNN Biasa (Dari Nol) ===")
-model_scratch = models.Sequential([
-    layers.Conv2D(16, (3, 3), activation='relu', input_shape=(224, 224, 3)),
-    layers.MaxPooling2D((2, 2)),
-    layers.Conv2D(32, (3, 3), activation='relu'),
-    layers.MaxPooling2D((2, 2)),
-    layers.Flatten(),
-    layers.Dense(64, activation='relu'),
-    layers.Dense(5, activation='softmax')  # 5 Output kelas
-])
+def extract_hog(gray_img):
+    features = hog(gray_img, orientations=9, pixels_per_cell=(16, 16),
+                   cells_per_block=(2, 2), visualize=False)
+    return features
 
-model_scratch.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+def extract_glcm(gray_img):
+    img_uint = (gray_img * 255).astype(np.uint8)
+    glcm = graycomatrix(img_uint, distances=[1],
+                        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+                        levels=256, symmetric=True, normed=True)
+    contrast = graycoprops(glcm, 'contrast').ravel()
+    correlation = graycoprops(glcm, 'correlation').ravel()
+    energy = graycoprops(glcm, 'energy').ravel()
+    homogeneity = graycoprops(glcm, 'homogeneity').ravel()
+    return np.hstack([contrast, correlation, energy, homogeneity])
 
-# Train Model Scratch (Cukup 3 epoch agar cepat untuk simulasi kuliah)
-print("Training Model CNN Scratch...")
-history_scratch = model_scratch.fit(X_train, y_train, epochs=3, validation_data=(X_test, y_test), batch_size=32)
+# ==========================================
+# 3. LOADING DATA DAN PROSES EKSTRAKSI
+# ==========================================
+print("=" * 60)
+print("Mulai memuat dataset DTD dan mengekstrak fitur...")
+print("=" * 60)
 
-# ==========================================================
-# 3. MEMBANGUN MODEL TRANSFER LEARNING (MOBILENETV2)
-# ==========================================================
-print("\n=== 3. Membangun Model Transfer Learning (MobileNetV2) ===")
-# Mengambil base model MobileNetV2 yang sudah terlatih (pre-trained) di dataset ImageNet
-base_model = MobileNetV2(input_shape=(224, 224, 3), include_top=False, weights='imagenet')
-base_model.trainable = False  # Membekukan bobot asli agar tidak berubah
+features_lbp, features_hog, features_glcm, labels = [], [], [], []
 
-model_tl = models.Sequential([
-    base_model,
-    layers.GlobalAveragePooling2D(),
-    layers.Dense(64, activation='relu'),
-    layers.Dense(5, activation='softmax')
-])
+for idx, class_name in enumerate(class_folders):
+    class_dir = os.path.join(DATASET_PATH, class_name)
+    # Ambil semua file gambar di dalam folder kelas
+    img_names = [f for f in os.listdir(class_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    print(f"-> Memproses kelas [{class_name}] : Ditemukan {len(img_names)} gambar. Silakan tunggu...")
+    
+    for img_name in img_names:
+        img_path = os.path.join(class_dir, img_name)
+        try:
+            img = io.imread(img_path)
+            if img.ndim == 3:
+                gray = color.rgb2gray(img)
+            else:
+                gray = img / 255.0
+            
+            gray_resized = transform.resize(gray, IMG_SIZE)
+            
+            # Ekstraksi fitur
+            features_lbp.append(extract_lbp(gray_resized))
+            features_hog.append(extract_hog(gray_resized))
+            features_glcm.append(extract_glcm(gray_resized))
+            labels.append(idx)
+        except Exception as e:
+            continue
 
-model_tl.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+X_lbp = np.array(features_lbp)
+X_hog = np.array(features_hog)
+X_glcm = np.array(features_glcm)
+y = np.array(labels)
 
-# Train Model Transfer Learning
-print("Training Model Transfer Learning (MobileNetV2)...")
-history_tl = model_tl.fit(X_train, y_train, epochs=3, validation_data=(X_test, y_test), batch_size=32)
+print("\n" + "=" * 60)
+print("PROSES EKSTRAKSI SELESAI!")
+print(f"Total gambar yang berhasil diproses: {len(y)}")
+print("=" * 60 + "\n")
 
-# ==========================================================
-# 4. VISUALISASI PERBANDINGAN PERFORMA & ANALISIS ERROR
-# ==========================================================
-acc_scratch = history_scratch.history['val_accuracy'][-1] * 100
-acc_tl = history_tl.history['val_accuracy'][-1] * 100
+# ==========================================
+# 4. KLASIFIKASI & EVALUASI PERFORMA
+# ==========================================
+print("Mulai melatih model dan menghitung akurasi...")
+feature_sets = {'LBP': X_lbp, 'HOG': X_hog, 'GLCM': X_glcm}
+classifiers = {
+    'SVM': SVC(kernel='linear', random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42)
+}
 
-# Plot Diagram Batang Perbandingan Akurasi
-fig, ax = plt.subplots(figsize=(7, 5))
-models_label = ['CNN Biasa (Scratch)', 'Transfer Learning (MobileNetV2)']
-accuracies = [acc_scratch, acc_tl]
+results = {}
 
-bars = ax.bar(models_label, accuracies, color=['#e74c3c', '#2ecc71'], width=0.5)
-ax.set_ylabel('Akurasi Validasi (%)')
-ax.set_title('Perbandingan Model: CNN Biasa vs Transfer Learning')
-ax.set_ylim(0, 110)
-ax.grid(axis='y', linestyle='--', alpha=0.5)
+for f_name, X_data in feature_sets.items():
+    # Split: 80% Train, 20% Test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_data, y, test_size=0.2, random_state=42, stratify=y
+    )
+    for c_name, clf in classifiers.items():
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        results[f"{f_name} + {c_name}"] = acc
+        print(f"[Sukses] Akurasi Kombinasi [{f_name} + {c_name}]: {acc:.4f}")
 
+# ==========================================
+# 5. VISUALISASI HASIL KINERJA
+# ==========================================
+plt.figure(figsize=(11, 6))
+
+combinations = list(results.keys())
+accuracies = list(results.values())
+
+# Urutkan hasil agar grafik batang berurutan
+sorted_indices = np.argsort(accuracies)
+combinations = [combinations[i] for i in sorted_indices]
+accuracies = [accuracies[i] for i in sorted_indices]
+
+colors = ['#E6E6FA', '#DDA0DD', '#DA70D6', '#BA55D3', '#9370DB', '#7B68EE']
+bars = plt.barh(combinations, accuracies, color=colors, edgecolor='grey', height=0.6)
+
+plt.xlabel('Akurasi (0.0 - 1.0)', fontsize=11, fontweight='bold', labelpad=10)
+plt.title('Perbandingan Performa Ekstraksi Fitur Tekstur\n(5 Kelas DTD - 120 Gambar Per Kelas)', 
+          fontsize=13, fontweight='bold', pad=15)
+plt.xlim(0, 1.1)
+plt.grid(axis='x', linestyle='--', alpha=0.5)
+
+# Tampilkan label nilai akurasi di setiap bar
 for bar in bars:
-    height = bar.get_height()
-    ax.annotate(f'{height:.2f}%',
-                xy=(bar.get_x() + bar.get_width() / 2, height),
-                xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+    width = bar.get_width()
+    plt.text(width + 0.01, bar.get_y() + bar.get_height()/2,
+             f'{width:.4f}',
+             va='center', ha='left', fontsize=10, fontweight='bold', color='black')
 
-print("\nMenampilkan Grafik Perbandingan... (Tutup grafik untuk melihat kesimpulan teks)")
+plt.tight_layout()
 plt.show()
-
-# Analisis Error (Identifikasi Kasus Sulit)
-print("\n" + "="*60)
-print("ANALISIS ERROR & IDENTIFIKASI KASUS SULIT (TUGAS 3)")
-print("="*60)
-# Simulasi prediksi untuk analisis error
-predictions = model_tl.predict(X_test)
-pred_classes = np.argmax(predictions, axis=1)
-salah_prediksi = np.where(pred_classes != y_test)[0]
-
-print(f"Total data uji: {len(y_test)} gambar")
-print(f"Jumlah gambar yang salah diprediksi oleh MobileNetV2: {len(salah_prediksi)} gambar")
-print("\nFaktor Penyebab Kasus Sulit (Analisis Teoretis Dataset Kustom):")
-print("1. Keterbatasan Data: Jumlah data (100 per kelas) tergolong sangat kecil bagi CNN biasa untuk belajar fitur dari nol.")
-print("2. Analisis Error Gambaran Fisik: Kasus sulit klasifikasi biasanya terjadi pada gambar yang memiliki latar belakang (background) yang terlalu ramai / mirip antar kelas, atau objek utama yang mengalami salah rotasi dan pencahayaan ekstrem.")
-print("="*60)
